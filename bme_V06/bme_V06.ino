@@ -62,6 +62,7 @@ typedef struct  {
   int clientPort;
   long transmitDelay;
   byte logger;
+  int altitude;
 } positionStruct;
 positionStruct station;    //declare la structure
 
@@ -71,7 +72,7 @@ long EcratMillis;
 char car;
 
 void setup(void)
-{
+{  
   strcpy(station.clientAdress, "cwop.aprs.net");
   station.clientPort = 14580;
   station.transmitDelay = 10;
@@ -80,6 +81,7 @@ void setup(void)
   Serial.begin(115200);
   Serial.println();
   delay(10);
+  
   SPIFFS.begin();
   if (SPIFFS.exists("/ssid.txt") == 0) {
     configMenu();
@@ -234,7 +236,7 @@ void updateServer()
       f.print(buffer);
       sprintf(buffer, "%02d:%02d:%02d;", dateTime.hour, dateTime.minute, dateTime.second);
       f.print(buffer);
-      sprintf(buffer, "%03d;%02d;%05d\n", wx.temperatureF / 10, wx.humidite, wx.pression / 10);
+      sprintf(buffer, "%03d;%02d;%05d\n", wx.temperatureC / 10, wx.humidite, wx.pression / 10);
       f.print(buffer);
       f.close();
     }
@@ -465,28 +467,38 @@ void printBme()
 {
   wx.temperatureC = (int) (mySensor.readTempC() * 10);
   wx.temperatureF = (int) (mySensor.readTempF() * 10);
-  wx.pression = (int) mySensor.readFloatPressure();
+ // wx.pression = (int) mySensor.readFloatPressure();
   wx.humidite = (int) mySensor.readFloatHumidity();
+
+  float temp=mySensor.readTempC();
+  float pres= mySensor.readFloatPressure();
+
+  Serial.print("Pressure at home level: ");
+  Serial.print(pres, 2);
+  Serial.println(" Pa");
+
+  pres= pres * ( pow(1.0 -(0.0065 * (float) station.altitude * -1 /(273.15+temp)), 5.255));
+
+  wx.pression=(int) pres;
+
+  Serial.print("Pressure at sea level: ");
+  Serial.print(pres, 2);
+  Serial.println(" Pa");
 
 
   Serial.print("Temperature: ");
-  Serial.print(mySensor.readTempC(), 2);
+  Serial.print(temp, 2);
   Serial.println(" degrees C");
 
   Serial.print("Temperature: ");
   Serial.print(mySensor.readTempF(), 2);
   Serial.println(" degrees F");
 
-  Serial.print("Pressure: ");
-  Serial.print(mySensor.readFloatPressure(), 2);
-  Serial.println(" Pa");
-
   Serial.print("%RH: ");
   Serial.print(mySensor.readFloatHumidity(), 2);
   Serial.println(" %");
 
   Serial.println();
-
 
 }
 
@@ -517,7 +529,7 @@ byte detectMenu()
       Serial.write(countDown + 0x30);
     }
   }
-  while (EcratMillisSerial < 5000);
+  while (EcratMillisSerial < 10000);
   Serial.println();
   return 0;
 }
@@ -635,11 +647,12 @@ void configWeather()
     Serial.println(F("1 set callsign station"));
     Serial.println(F("2 set longitude"));
     Serial.println(F("3 set latitude"));
-    Serial.println(F("4 set server address"));
-    Serial.println(F("5 set server port"));
-    Serial.println(F("6 set transmit delay"));
-    Serial.println(F("7 logger enable"));
-    Serial.println(F("8 show weather config"));
+    Serial.println(F("4 set altitude"));
+    Serial.println(F("5 set server address"));
+    Serial.println(F("6 set server port"));
+    Serial.println(F("7 set transmit delay"));
+    Serial.println(F("8 logger enable"));
+    Serial.println(F("9 show weather config"));
     Serial.println(F("-----------"));
     carMenu = readCarMenu();
     switch (carMenu) {
@@ -656,31 +669,38 @@ void configWeather()
         readCharArray(station.latitude);
         break;
       case '4' :
+        Serial.println(F("type your altitude (meters) ex: 78"));
+        readCharArray(buffer);
+        station.altitude=atoi(buffer);
+        break;
+      case '5' :
         Serial.println(F("type your server address, default : cwop.aprs.net"));
         readCharArray(station.clientAdress);
         break;
-      case '5' :
+      case '6' :
         Serial.println(F("type your server port, default : 14580"));
         readCharArray(buffer);
         station.clientPort = atoi(buffer);
         break;
-      case '6' :
+      case '7' :
         Serial.println(F("type transmit delay, default 10 minutes"));
         readCharArray(buffer);
         station.transmitDelay = atoi(buffer);
         break;
-      case '7' :
+      case '8' :
         Serial.println(F("logger enable 0/1, defaut 0"));
         readCharArray(buffer);
         station.logger = atoi(buffer);
         break;
-      case '8' :
+      case '9' :
         Serial.print(F("callsign : "));
         Serial.println(station.callsign);
         Serial.print(F("longitude : "));
         Serial.println(station.longitude);
         Serial.print(F("latitude : "));
         Serial.println(station.latitude);
+        Serial.print(F("altitude : "));
+        Serial.println(station.altitude);
         Serial.print(F("server address : "));
         Serial.println(station.clientAdress);
         Serial.print(F("server port : "));
