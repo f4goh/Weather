@@ -30,7 +30,7 @@ BME280 mySensor;
 
 /*
 const char* ssid = "Livebox-0E00";
-const char* password = "FzhSJGFouVGNLYKAMa";
+const char* password = "xxxx";
 const char* host = "cwop.aprs.net";
 */
 
