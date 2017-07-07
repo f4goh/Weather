@@ -1,0 +1,793 @@
+
+/*
+esp8266 with DHT11 Ai thinker t5 board
+- config menu with serial
+- ntp update
+- upload weather data on aprs servers
+- local web page for weather informations and configuration
+- add GMT menu
+ f4goh@orange.fr
+*/
+
+//#include <Wire.h>
+//#include <SPI.h>
+#include <ESP8266WiFi.h>
+#include <WiFiClient.h>
+#include <ESP8266WebServer.h>
+
+
+#include <NTPtimeESP.h>
+
+#include "FS.h"
+
+NTPtime NTPch("ch.pool.ntp.org");
+//NTPtime NTPch("time.nist.gov");
+
+
+
+#define DHTPIN 2 // DHT11 sensor on GPIO2.
+#include "DHT.h" // We're using the Adafruit version.
+DHT dht(DHTPIN, DHT11, 15);
+
+
+
+ESP8266WebServer server(80);
+
+strDateTime dateTime;
+byte nextMinTx;
+
+
+typedef struct  {
+  int temperatureC;
+  int temperatureF;
+  int pression ;
+  int humidite;
+} WeatherStruct;
+WeatherStruct wx;    //declare la structure
+
+typedef struct  {
+  char ssid[50];
+  char password[50];
+} configStruct;
+configStruct internet;    //declare la structure
+
+typedef struct  {
+  char callsign[10];
+  char longitude[10];
+  char latitude[10];
+  char clientAdress[20];
+  int clientPort;
+  long transmitDelay;
+  byte logger;
+  byte gmt;
+} positionStruct;
+positionStruct station;    //declare la structure
+
+long previousMillis = 0;
+long currentMillis;
+long EcratMillis;
+
+
+void setup(void)
+{
+  strcpy(station.clientAdress, "cwop.aprs.net");
+  station.clientPort = 14580;
+  station.transmitDelay = 10;
+  station.logger = 0;
+  station.gmt = 1;
+
+  Serial.begin(115200);
+  Serial.println();
+  delay(10);
+  SPIFFS.begin();
+  if (SPIFFS.exists("/ssid.txt") == 0) {
+    configMenu();
+  }
+  else
+  {
+    readSsidFile();
+  }
+  if (SPIFFS.exists("/station.txt") == 0) {
+    configMenu();
+  }
+  else
+  {
+    readStationFile();
+  }
+  if  (detectMenu() == 1) configMenu();
+  ssidConnect();
+  dht.begin();
+  printDht();
+
+  delay(1000);
+
+
+  server.on("/", handleRoot);
+  /*
+  server.on("/inline", []() {
+    server.send(200, "text/plain", "this works as well");
+  });
+  server.on ( "/test.svg", drawGraph );
+  */
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  ntp();
+  previousMillis = millis();
+
+}
+
+
+void handleRoot() {
+  char temp[600];
+  snprintf ( temp, 600,
+             "<html>\
+  <head>\
+    <meta http-equiv='refresh' content='5'/>\
+    <title>%s Weather Station</title>\
+    <style>\
+      body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+    </style>\
+  </head>\
+  <body>\
+    <h1>%s Weather Station</h1>\
+    <p>Uptime: %02d:%02d:%02d</p><br>\
+    <p>Temperature: %d degC</p><br>\
+    <p>Humidity: %d %</p><br>\
+  </body>\
+</html>",
+             station.callsign, station.callsign, dateTime.hour, dateTime.minute, dateTime.second, wx.temperatureC / 10, wx.humidite
+           );
+  server.send ( 200, "text/html", temp );
+}
+
+
+
+
+
+void handleNotFound() {
+  //digitalWrite(led, 1);
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  server.send(404, "text/plain", message);
+  //digitalWrite(led, 0);
+}
+/*
+void drawGraph() {
+  String out = "";
+  char temp[100];
+  out += "<svg xmlns=\"http://www.w3.org/2000/svg\" version=\"1.1\" width=\"400\" height=\"150\">\n";
+  out += "<rect width=\"400\" height=\"150\" fill=\"rgb(250, 230, 210)\" stroke-width=\"1\" stroke=\"rgb(0, 0, 0)\" />\n";
+  out += "<g stroke=\"black\">\n";
+  int y = rand() % 130;
+  for (int x = 10; x < 390; x += 10) {
+    int y2 = rand() % 130;
+    sprintf(temp, "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" stroke-width=\"1\" />\n", x, 140 - y, x + 10, 140 - y2);
+    out += temp;
+    y = y2;
+  }
+  out += "</g>\n</svg>\n";
+
+  server.send ( 200, "image/svg+xml", out);
+}
+*/
+
+void loop()
+{
+  //Each loop, take a reading.
+  //Start with temperature, as that data is needed for accurate compensation.
+  //Reading the temperature updates the compensators of the other functions
+  //in the background.
+  server.handleClient();
+
+  updateTime();
+
+
+  if ((dateTime.minute >= nextMinTx) && (dateTime.second == 0)) {
+    updateServer();
+    previousMillis = millis();
+  }
+
+  if (Serial.available() > 0) {
+    if (Serial.read() == 'm') {
+      while (Serial.read() != '\n') {};
+      configMenu();
+      ntp();
+    }
+    if (Serial.read() == 'f') {
+      while (Serial.read() != '\n') {};
+      updateServer();
+    }
+  }
+}
+
+
+void updateTime()
+{
+  currentMillis = millis();
+  EcratMillis = currentMillis - previousMillis;
+  if (EcratMillis > 1000) {
+    previousMillis = currentMillis;
+    dateTime.second = (dateTime.second + 1) % 60;
+    char currentTime[10];
+    sprintf(currentTime, "%02d:%02d:%02d", dateTime.hour, dateTime.minute, dateTime.second);
+    Serial.println(currentTime);
+    if (dateTime.second == 0) {
+      dateTime.minute = (dateTime.minute + 1) % 60;
+      if (dateTime.minute == 0) {
+        dateTime.hour = (dateTime.hour + 1) % 24;
+      }
+    }
+  }
+}
+
+
+void updateServer()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    printDht();
+    ntp();
+    connexion();
+  }
+  if (station.logger == 1) {
+    if (SPIFFS.exists("/logger.txt") == 1) {
+      String s;
+      //long sizefile;
+      File f = SPIFFS.open("/logger.txt", "a");
+      if (!f) {
+        Serial.println("file open failed");
+      }
+      Serial.println("====== add data logger =========");
+      char buffer[50];
+      sprintf(buffer, "%02d/%02d/%04d;", dateTime.day, dateTime.month, dateTime.year);
+      f.print(buffer);
+      sprintf(buffer, "%02d:%02d:%02d;", dateTime.hour, dateTime.minute, dateTime.second);
+      f.print(buffer);
+      // sprintf(buffer, "%03d;%02d;%05d\n", wx.temperatureF / 10, wx.humidite, wx.pression / 10);
+      sprintf(buffer, "%03d;%02d\n", wx.temperatureF / 10, wx.humidite);
+      f.print(buffer);
+      f.close();
+    }
+  }
+}
+
+/*
+ connexion ntp et acces au serveur meto pour uploder les donnees
+ */
+
+/*
+ * The structure contains following fields:
+ * struct strDateTime
+{
+  byte hour;
+  byte minute;
+  byte second;
+  int year;
+  byte month;
+  byte day;
+  byte dayofWeek;
+  boolean valid;
+};
+ */
+void ntp()
+{
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    // first parameter: Time zone in floating point (for India); second parameter: 1 for European summer time; 2 for US daylight saving time (not implemented yet)
+    do
+    {
+      dateTime = NTPch.getNTPtime(0.0, station.gmt);
+      NTPch.printDateTime(dateTime);
+    }
+    while (!dateTime.valid);
+    nextMinTx = (dateTime.minute + station.transmitDelay) % 60;
+    Serial.print("->>>>> next tx at : ");
+    char buffer[20];
+    sprintf(buffer, "%02d:%02d:%02d", dateTime.hour, nextMinTx, 0);
+    Serial.println(buffer);
+  }
+}
+
+
+void connexion()
+{
+  char login[60];
+  char sentence[150];
+  //wx.temperatureF = wx.temperatureF * -1;
+
+  sprintf(login, "user %s pass -1 vers VERSION ESP8266", station.callsign);
+  //  sprintf(sentence, "%s>APRS,TCPXX*:@%02d%02d%02dz%s/%s_.../...g...t%03dr...p...P...h%02db%05d", station.callsign, dateTime.hour, dateTime.minute, dateTime.second, station.latitude, station.longitude, wx.temperatureF / 10, wx.humidite, wx.pression / 10);
+  sprintf(sentence, "%s>APRS,TCPXX*:@%02d%02d%02dz%s/%s_.../...g...t%03dr...p...P...h%02db.....", station.callsign, dateTime.hour, dateTime.minute, dateTime.second, station.latitude, station.longitude, wx.temperatureF / 10, wx.humidite);
+  Serial.println(sentence);
+  //Serial.println("compare");
+  //Serial.println("FW0383>APRS,TCPXX*:@164300z4759.75N/00012.21Et034h91b10032");
+  //
+
+  WiFiClient client;
+  //const int httpPort = 14580;
+
+  if (!client.connect(station.clientAdress, station.clientPort)) {
+    Serial.println("connection failed");
+    return;
+  }
+  //client.println("user FW0383 pass -1 vers VERSION ESP8266");
+  client.println(login);
+
+
+  unsigned long timeout = millis();
+  while (client.available() == 0) {
+    if (millis() - timeout > 5000) {
+      Serial.println(">>> Client Timeout !");
+      client.stop();
+      return;
+    }
+  }
+  while (client.available()) {
+    String line = client.readStringUntil('\r');
+    Serial.print(line);
+  }
+  //client.println("FW0383>APRS,TCPXX*:@164300z4759.75N/00012.21E_256/013g020t034r000p013P001h91b10032");
+  //client.println("FW0383>APRS,TCPXX*:@164300z4759.75N/00012.21Et034h91b10032");
+  client.println(sentence);
+
+  Serial.println();
+  Serial.println("closing connection");
+
+  client.stop();
+
+}
+
+// sensor
+
+void printDht()
+{
+  /*
+    temperature = dht.readTemperature();
+    humidity = dht.readHumidity();
+    while ((isnan(temperature) || isnan(humidity))
+           || (temperature == 0 && humidity == 0)) {
+      Serial.print("!");
+      delay(500);
+      temperature = dht.readTemperature();
+      humidity = dht.readHumidity();
+    }
+    Serial.println("");
+    */
+
+
+  wx.temperatureC = (int) (dht.readTemperature() * 10);
+  wx.temperatureF = (int) ((dht.readTemperature() * 1.8 + 32) * 10);
+  // wx.pression = (int) mySensor.readFloatPressure();
+  wx.humidite = (int) dht.readHumidity();
+
+
+  Serial.print("Temperature: ");
+  Serial.print(dht.readTemperature(), 2);
+  Serial.println(" degrees C");
+  /*
+    Serial.print("Temperature: ");
+    Serial.print(mySensor.readTempF(), 2);
+    Serial.println(" degrees F");
+
+    Serial.print("Pressure: ");
+    Serial.print(mySensor.readFloatPressure(), 2);
+    Serial.println(" Pa");
+  */
+  Serial.print("%RH: ");
+  Serial.print(dht.readHumidity(), 2);
+  Serial.println(" %");
+
+  Serial.println();
+
+
+}
+
+/****************************************************************************
+ * menu
+ * */
+
+
+byte detectMenu()
+{
+  long previousMillisSerial = 0;
+  long currentMillisSerial;
+  long EcratMillisSerial;
+  int countDown = 0;
+  Serial.println(F("m for boot menu"));
+  previousMillisSerial = millis();
+  do {
+    currentMillisSerial = millis();
+    EcratMillisSerial = currentMillisSerial - previousMillisSerial;
+    if (Serial.available() > 0) {
+      if (Serial.read() == 'm') {
+        while (Serial.read() != '\n') {};
+        return 1;
+      }
+    }
+    if ((EcratMillisSerial / 1000) != countDown) {
+      countDown++;
+      Serial.write(countDown + 0x30);
+    }
+  }
+  while (EcratMillisSerial < 15000);
+  Serial.println();
+  return 0;
+}
+
+void configMenu()
+{
+  char carMenu;
+  do {
+    carMenu = 0;
+    Serial.println(F("-----------"));
+    Serial.println(F("Config menu"));
+    Serial.println(F("0 Quit menu"));
+    Serial.println(F("1 format file system"));
+    Serial.println(F("2 config wifi access point"));
+    Serial.println(F("3 config weather station"));
+    Serial.println(F("4 test ntp"));
+    Serial.println(F("5 test DHT 11"));
+    Serial.println(F("6 test server upload"));
+    Serial.println(F("7 print weather data logger (historic)"));
+    Serial.println(F("8 create and erase weather data logger"));
+    Serial.println(F("-----------"));
+    carMenu = readCarMenu();
+    switch (carMenu) {
+      case '1' :
+        Serial.println("Please wait 30 secs for SPIFFS to be formatted");
+        //SPIFFS.format();
+        Serial.println("Spiffs formatted");
+        break;
+      case '2' : configAcessPoint();
+        break;
+      case '3' : configWeather();
+        break;
+      case '4' : ssidConnect(); ntp(); //prévoir un test de connexion
+        break;
+      case '5' : dht.begin(); printDht();
+        break;
+      case '6' : dht.begin(); printDht();  ssidConnect(); ntp(); connexion();
+        break;
+      case '7' : showlogger();
+        break;
+      case '8' : createEraselogger();
+        break;
+      case '0' :
+        break;
+      default : Serial.println(F("error"));
+    }
+  } while (carMenu != '0');
+}
+
+void configAcessPoint()
+{
+  if (SPIFFS.exists("/ssid.txt") == 1) {
+    readSsidFile();
+  }
+  else
+  {
+    Serial.println(F("no ssid config file"));
+  }
+  char carMenu;
+  do {
+    carMenu = 0;
+    Serial.println(F("-----------"));
+    Serial.println(F("Config wifi access point menu"));
+    Serial.println(F("0 Save and exit acess point menu"));
+    Serial.println(F("1 ssid list"));
+    Serial.println(F("2 set ssid"));
+    Serial.println(F("3 set ssid password"));
+    Serial.println(F("4 show ssid config"));
+    Serial.println(F("5 test ssid"));
+    Serial.println(F("-----------"));
+    carMenu = readCarMenu();
+    switch (carMenu) {
+      case '1' :
+        wifiScan();
+        break;
+      case '2' :
+        Serial.println(F("type your ssid"));
+        readCharArray(internet.ssid);
+        break;
+      case '3' :
+        Serial.println(F("type your password"));
+        readCharArray(internet.password);
+        break;
+      case '4' :
+        Serial.println(F("your wifi ssid config is"));
+        Serial.println(internet.ssid);
+        Serial.println(internet.password);
+        break;
+      case '5' :
+        Serial.println(F("test ssid internet access"));
+        ssidConnect();
+        break;
+      default : Serial.println(F("error"));
+    }
+  } while (carMenu != '0');
+  writeSsidFile();
+}
+
+void configWeather()
+{
+  if (SPIFFS.exists("/station.txt") == 1) {
+    readStationFile();
+  }
+  else
+  {
+    Serial.println(F("no station config file"));
+  }
+  char carMenu;
+  char buffer[10];
+  do {
+    carMenu = 0;
+    Serial.println(F("-----------"));
+    Serial.println(F("Config weather station"));
+    Serial.println(F("0 Save and exit weather station menu"));
+    Serial.println(F("1 set callsign station"));
+    Serial.println(F("2 set longitude"));
+    Serial.println(F("3 set latitude"));
+    Serial.println(F("4 set server address"));
+    Serial.println(F("5 set server port"));
+    Serial.println(F("6 set transmit delay"));
+    Serial.println(F("7 logger enable"));
+    Serial.println(F("8 set GMT"));
+    Serial.println(F("9 show weather config"));
+    Serial.println(F("-----------"));
+    carMenu = readCarMenu();
+    switch (carMenu) {
+      case '1' :
+        Serial.println(F("type your callsign station ex: FWxxxx"));
+        readCharArray(station.callsign);
+        break;
+      case '2' :
+        Serial.println(F("type your longitude ex: 00012.21E"));
+        readCharArray(station.longitude);
+        break;
+      case '3' :
+        Serial.println(F("type your latitude ex: 4759.75N"));
+        readCharArray(station.latitude);
+        break;
+      case '4' :
+        Serial.println(F("type your server address, default : cwop.aprs.net"));
+        readCharArray(station.clientAdress);
+        break;
+      case '5' :
+        Serial.println(F("type your server port, default : 14580"));
+        readCharArray(buffer);
+        station.clientPort = atoi(buffer);
+        break;
+      case '6' :
+        Serial.println(F("type transmit delay, default 10 minutes"));
+        readCharArray(buffer);
+        station.transmitDelay = atoi(buffer);
+        break;
+      case '7' :
+        Serial.println(F("logger enable 0/1, defaut 0"));
+        readCharArray(buffer);
+        station.logger = atoi(buffer);
+        break;
+      case '8' :
+        Serial.println(F("set GMT, defaut 1"));
+        readCharArray(buffer);
+        station.gmt = atoi(buffer);
+        break;
+      case '9' :
+        Serial.print(F("callsign : "));
+        Serial.println(station.callsign);
+        Serial.print(F("longitude : "));
+        Serial.println(station.longitude);
+        Serial.print(F("latitude : "));
+        Serial.println(station.latitude);
+        Serial.print(F("server address : "));
+        Serial.println(station.clientAdress);
+        Serial.print(F("server port : "));
+        Serial.println(station.clientPort);
+        Serial.print(F("tx delay : "));
+        Serial.println(station.transmitDelay);
+        Serial.print(F("logger enable : "));
+        Serial.println(station.logger);
+        Serial.print(F("GMT is : "));
+        Serial.println(station.gmt);
+        break;
+      case '0' :
+        break;
+      default : Serial.println(F("error"));
+    }
+  } while (carMenu != '0');
+  writeStationFile();
+}
+
+void readCharArray(char *buffer)
+{
+  char car;
+  int ptr = 0;
+  do
+  {
+    if (Serial.available() > 0) {
+      car = Serial.read();
+      if (car != '\n') {
+        buffer[ptr++] = car;
+      }
+    }
+  }
+  while (car != '\n');
+  buffer[ptr] = 0;
+}
+
+char readCarMenu()
+{
+  char car = 0;
+  char ret = 0;
+  while (car != '\n')
+  {
+    if (Serial.available() > 0) {
+      car = Serial.read();
+      if ((car >= '0') && (car <= '9')) {
+        ret = car;
+      }
+    }
+  }
+  return ret;
+}
+
+void wifiScan()
+{
+  Serial.println(F("scan start"));
+  // WiFi.scanNetworks will return the number of networks found
+  int n = WiFi.scanNetworks();
+  Serial.println(F("scan done"));
+  if (n == 0)
+    Serial.println(F("no networks found"));
+  else
+  {
+    Serial.print(n);
+    Serial.println(F(" networks found"));
+    for (int i = 0; i < n; ++i)
+    {
+      // Print SSID and RSSI for each network found
+      Serial.print(i + 1);
+      Serial.print(F(": "));
+      Serial.print(WiFi.SSID(i));
+      Serial.print(F(" ("));
+      Serial.print(WiFi.RSSI(i));
+      Serial.print(F(")"));
+      Serial.println((WiFi.encryptionType(i) == ENC_TYPE_NONE) ? " " : "*");
+      delay(10);
+    }
+  }
+  Serial.println("");
+}
+
+void writeSsidFile()
+{
+  File f = SPIFFS.open("/ssid.txt", "w+");
+  if (!f) {
+    Serial.println(F("file open failed"));
+    return;
+  }
+  Serial.println(F("====== Writing to ssid.txt file ========="));
+  for (int i = 0; i < sizeof(configStruct); i++) {
+    f.write(*((char*)&internet + i));
+  }
+  f.close();
+  return;
+}
+
+
+void readSsidFile()
+{
+  File f = SPIFFS.open("/ssid.txt", "r+");
+  if (!f) {
+    Serial.println(F("file open failed"));
+    return;
+  }
+  Serial.println(F("====== Reading ssid.txt file ========="));
+  for (int i = 0; i < sizeof(configStruct); i++) {
+    *((char*)&internet + i) = f.read();
+  }
+  f.close();
+  return;
+}
+
+void writeStationFile()
+{
+  File f = SPIFFS.open("/station.txt", "w+");
+  if (!f) {
+    Serial.println(F("file open failed"));
+    return;
+  }
+  Serial.println(F("====== Writing to station.txt file ========="));
+  for (int i = 0; i < sizeof(positionStruct); i++) {
+    f.write(*((char*)&station + i));
+  }
+  f.close();
+  return;
+}
+
+void readStationFile()
+{
+  File f = SPIFFS.open("/station.txt", "r+");
+  if (!f) {
+    Serial.println(F("file open failed"));
+    return;
+  }
+  Serial.println(F("====== Reading station.txt file ========="));
+  for (int i = 0; i < sizeof(positionStruct); i++) {
+    *((char*)&station + i) = f.read();
+  }
+  f.close();
+  return;
+}
+
+
+void createEraselogger()
+{
+  File f = SPIFFS.open("/logger.txt", "w");
+  if (!f) {
+    Serial.println("file open failed");
+  }
+  Serial.println("====== new logger file =========");
+  f.println("date;time;temperature;humidity;pressure");
+  f.close();
+}
+
+
+void showlogger()
+{
+  if (SPIFFS.exists("/logger.txt") == 1) {
+    String s;
+    //long sizefile;
+    File f = SPIFFS.open("/logger.txt", "r");
+    if (!f) {
+      Serial.println("file open failed");
+    }
+    //sizefile=f.size()-42;
+    Serial.println("====== read logger file =========");
+    do {
+      s = f.readStringUntil('\n');
+      Serial.println(s);
+    }
+    while (s.length() > 0);
+    f.close();
+  }
+}
+
+
+
+
+void ssidConnect()
+{
+  Serial.println(internet.ssid);
+  Serial.println(internet.password);
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.print(F("Connecting to "));
+    Serial.println(internet.ssid);
+    WiFi.mode(WIFI_AP_STA);
+    //  WiFi.mode(WIFI_STA);
+    WiFi.begin(internet.ssid, internet.password);
+    Serial.println();
+    // Wait for connection
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(500);
+      Serial.print(F("."));
+    }
+  }
+  Serial.println();
+  Serial.print(F("Connected to "));
+  Serial.println(internet.ssid);
+  Serial.print(F("IP address: "));
+  Serial.println(WiFi.localIP());
+}
+
